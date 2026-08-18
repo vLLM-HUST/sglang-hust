@@ -2212,5 +2212,68 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         args._check_two_batch_overlap()
 
 
+class TestDcpValidation(CustomTestCase):
+    """Args-time guards for --dcp-size combinations that previously crashed
+    deep in model init or at decode cuda-graph capture."""
+
+    def test_dcp_must_divide_tp(self):
+        for tp, dcp in [(1, 2), (4, 3), (2, 4)]:
+            args = ServerArgs(model_path="dummy", tp_size=tp, dcp_size=dcp)
+            with self.assertRaisesRegex(ValueError, "divisor of --tp-size"):
+                args._handle_dcp_validation()
+
+    def test_dcp_divisor_of_tp_accepted(self):
+        for tp, dcp in [(4, 4), (4, 2), (8, 4), (4, 1)]:
+            args = ServerArgs(model_path="dummy", tp_size=tp, dcp_size=dcp)
+            args._handle_dcp_validation()
+
+    def test_explicit_fa3_with_dcp_rejected_for_mla(self):
+        args = ServerArgs(
+            model_path="dummy", tp_size=4, dcp_size=4, attention_backend="fa3"
+        )
+        with patch.object(ServerArgs, "use_mla_backend", return_value=True):
+            with self.assertRaisesRegex(ValueError, "DCP decode"):
+                args._handle_dcp_validation()
+
+    def test_explicit_fa3_decode_backend_with_dcp_rejected_for_mla(self):
+        args = ServerArgs(
+            model_path="dummy", tp_size=4, dcp_size=4, decode_attention_backend="fa3"
+        )
+        with patch.object(ServerArgs, "use_mla_backend", return_value=True):
+            with self.assertRaisesRegex(ValueError, "DCP decode"):
+                args._handle_dcp_validation()
+
+    def test_fa3_with_dcp_allowed_for_prefill_only_worker(self):
+        # Prefill-only workers never run the DCP decode path.
+        args = ServerArgs(
+            model_path="dummy",
+            tp_size=4,
+            dcp_size=4,
+            attention_backend="fa3",
+            disaggregation_mode="prefill",
+        )
+        args._handle_dcp_validation()
+
+    def test_fa3_with_dcp_allowed_for_mha(self):
+        args = ServerArgs(
+            model_path="dummy", tp_size=4, dcp_size=4, attention_backend="fa3"
+        )
+        with patch.object(ServerArgs, "use_mla_backend", return_value=False):
+            args._handle_dcp_validation()
+
+    def test_mla_default_backend_avoids_fa3_under_dcp_on_hopper(self):
+        model_config = MagicMock()
+        model_config.hf_config.architectures = []
+        with patch.object(
+            server_args_module, "is_hopper_with_cuda_12_3", return_value=True
+        ):
+            args = ServerArgs(model_path="dummy", tp_size=4, dcp_size=4)
+            self.assertEqual(
+                args._get_default_attn_backend(True, model_config), "flashinfer"
+            )
+            args = ServerArgs(model_path="dummy", tp_size=4, dcp_size=1)
+            self.assertEqual(args._get_default_attn_backend(True, model_config), "fa3")
+
+
 if __name__ == "__main__":
     unittest.main()
