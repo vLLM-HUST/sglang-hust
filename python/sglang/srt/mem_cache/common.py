@@ -192,6 +192,71 @@ def retraction_discard(req: Req, tree_cache: BasePrefixCache, backend: str) -> N
     req.retraction_backup = None
 
 
+def _uses_segment_reuse_stitch(req: Req) -> bool:
+    predicate = getattr(req, "uses_segment_reuse_stitch", None)
+    return callable(predicate) and bool(predicate())
+
+
+def _release_segment_reuse_stitched_kv_cache(
+    req: Req, tree_cache: BasePrefixCache
+) -> None:
+    """Release request-owned KV without freeing a borrowed stitched body.
+
+    Segment-reuse adapters install the request fields and cache callback used
+    here.  Validate the complete ownership boundary before mutating allocator
+    or request state; an incomplete/mismatched adapter contract must fail
+    closed instead of falling through to native prefix-cache insertion.
+    """
+    body_indices = getattr(req, "segment_reuse_body_kv_indices", None)
+    insert_pos = getattr(req, "segment_reuse_body_insert_pos", None)
+    release_body_refs = getattr(
+        tree_cache, "segment_reuse_release_req_body_refs", None
+    )
+    dec_lock_ref = getattr(tree_cache, "dec_lock_ref", None)
+
+    if not isinstance(body_indices, torch.Tensor) or body_indices.numel() == 0:
+        raise RuntimeError("stitched request is missing borrowed body KV indices")
+    if not isinstance(insert_pos, int):
+        raise RuntimeError("stitched request is missing an integer body insert position")
+    if not callable(release_body_refs) or not callable(dec_lock_ref):
+        raise RuntimeError("tree cache is missing stitched ownership callbacks")
+    if getattr(req, "segment_reuse_borrowed_body_object_id", None) is None:
+        raise RuntimeError("stitched request is missing borrowed body identity")
+
+    if req.kv is None:
+        raise RuntimeError("stitched request is missing KV allocation state")
+    if tree_cache.supports_mamba() or req.mamba_pool_idx is not None:
+        raise RuntimeError("stitched release does not support Mamba state")
+
+    allocator = tree_cache.token_to_kv_pool_allocator
+    page_size = int(allocator.page_size)
+    committed_len = int(req.effective_kv_committed_len())
+    allocated_len = int(req.kv.kv_allocated_len)
+    body_len = int(body_indices.numel())
+    body_end = insert_pos + body_len
+    if insert_pos < 0 or body_end > committed_len or committed_len > allocated_len:
+        raise RuntimeError("stitched body range is outside the committed KV mapping")
+    if insert_pos % page_size or body_end % page_size:
+        raise RuntimeError("stitched body ownership is not page aligned")
+
+    request_mapping = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx]
+    mapped_body = request_mapping[insert_pos:body_end]
+    expected_body = body_indices.to(device=mapped_body.device, dtype=mapped_body.dtype)
+    if not torch.equal(mapped_body, expected_body):
+        raise RuntimeError("stitched borrowed body identity does not match request mapping")
+
+    allocator.free_segments(
+        (
+            (request_mapping[:insert_pos], 0),
+            (request_mapping[body_end:allocated_len], body_end),
+        )
+    )
+    dec_lock_ref(req.last_node)
+    release_body_refs(req)
+    tree_cache.req_to_token_pool.free(req)
+    req.kv = None
+
+
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
     # the two resources currently have the same lifecycle, thus simplify logic below
     assert (req.req_pool_idx is None) == (req.kv is None)
@@ -206,6 +271,10 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
                 req.mamba_pool_idx.unsqueeze(-1)
             )
             req.mamba_pool_idx = None
+        return
+
+    if _uses_segment_reuse_stitch(req):
+        _release_segment_reuse_stitched_kv_cache(req, tree_cache)
         return
 
     effective_kv_committed_len = req.effective_kv_committed_len()
