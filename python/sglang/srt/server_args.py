@@ -9636,8 +9636,10 @@ class ServerArgs:
                 "topic": "",                      # ZMQ topic prefix on the
                                                   # SUB filter (empty =
                                                   # subscribe-all)
-                "block_size": <page_size>,        # subscribers MUST hash
-                                                  # prompts at this size
+                "block_size": <page_size * dcp_size>,  # the width KV events
+                                                  # are emitted at; subscribers
+                                                  # MUST hash prompts at this
+                                                  # size
                 "dp_size": <dp_size>,             # number of SUB sockets
                                                   # to open
             }
@@ -9694,7 +9696,11 @@ class ServerArgs:
             "endpoint_host": host,
             "endpoint_port_base": port,
             "topic": cfg.topic,
-            "block_size": page_size,
+            # Under DCP the radix tree pages (and therefore emits KV events)
+            # at page_size * dcp_size; advertise that logical width, or
+            # subscribers hash prompts at the wrong granularity and every
+            # lookup misses.
+            "block_size": page_size * max(1, self.dcp_size),
             "dp_size": self.dp_size,
         }
 

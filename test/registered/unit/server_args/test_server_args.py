@@ -2261,6 +2261,22 @@ class TestDcpValidation(CustomTestCase):
         with patch.object(ServerArgs, "use_mla_backend", return_value=False):
             args._handle_dcp_validation()
 
+    def test_kv_events_descriptor_reports_logical_block_size(self):
+        """Under DCP the radix tree emits KV events at page_size * dcp_size.
+        Advertising the physical page_size made every KV-aware router hash
+        prompts at the wrong width, silently pinning its hit rate to zero."""
+        kv_events = '{"publisher":"zmq","topic":"kv","endpoint":"tcp://*:5557"}'
+        args = ServerArgs(
+            model_path="dummy",
+            tp_size=4,
+            dcp_size=4,
+            page_size=64,
+            kv_events_config=kv_events,
+        )
+        self.assertEqual(args.describe_kv_events_publisher()["block_size"], 256)
+        args = ServerArgs(model_path="dummy", page_size=64, kv_events_config=kv_events)
+        self.assertEqual(args.describe_kv_events_publisher()["block_size"], 64)
+
     def test_mla_default_backend_avoids_fa3_under_dcp_on_hopper(self):
         model_config = MagicMock()
         model_config.hf_config.architectures = []
