@@ -1,0 +1,28 @@
+{
+  "schema_version": "1.0",
+  "canonical_registry": "https://github.com/vLLM-HUST/vllm-hust-docs/tree/codex/ecosystem-architecture-reorganization/registry",
+  "repository": "https://github.com/vLLM-HUST/sglang-hust",
+  "repository_role": "sibling_runtime",
+  "relation_to_runtime": "sibling_runtime",
+  "lifecycle": "incubating",
+  "artifacts": [
+    {
+      "id": "sglang-hust-runtime",
+      "artifact_type": "runtime_core",
+      "system_role": "inference_runtime",
+      "delivery_model": "source_repository",
+      "execution_planes": ["api", "scheduler", "worker", "native", "device"],
+      "integration_contracts": []
+    }
+  ],
+  "system_boundaries": {
+    "is": ["a complete sibling inference-serving runtime distribution"],
+    "is_not": [
+      "a vLLM plugin or platform profile",
+      "a component loaded into the vLLM-HUST process",
+      "automatically compatible with vLLM-HUST extension contracts"
+    ]
+  },
+  "validation": ["pre-commit run --all-files"],
+  "compatibility_document": "README.md"
+}
