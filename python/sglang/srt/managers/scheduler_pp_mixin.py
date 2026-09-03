@@ -15,6 +15,7 @@ from tqdm import tqdm
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
+from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -23,6 +24,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     set_is_extend_in_batch,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.utils import (
@@ -30,6 +32,7 @@ from sglang.srt.managers.utils import (
     get_logprob_dict_from_result,
     get_logprob_from_pp_outputs,
 )
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
@@ -37,8 +40,12 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.runtime_context import get_disagg, get_parallel
+from sglang.srt.sampling.sampling_observer_pp import (
+    add_auxiliary_output_to_pp_tensors,
+    pop_auxiliary_output_from_pp_tensors,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
+from sglang.srt.utils import DynamicGradMode, point_to_point_pyobj
 from sglang.srt.utils.common import get_device_module, is_xpu
 
 logger = logging.getLogger(__name__)
@@ -628,8 +635,11 @@ class SchedulerPPMixin:
                     origin_input_ids=input_ids,
                     sampling_params=sampling_params,
                 )
-                req.full_untruncated_fill_ids = req.origin_input_ids
-                req.logprob_start_len = -1
+                # Walk the same match -> lock -> alloc lifecycle as a scheduled
+                # request so release_kv_cache can release it symmetrically.
+                req.init_next_round_input(self.tree_cache)
+                lock = self.tree_cache.inc_lock_ref(req.last_node)
+                req.swa_uuid_for_lock = lock.swa_uuid_for_lock
                 req.set_extend_range(
                     len(req.prefix_indices), len(req.full_untruncated_fill_ids)
                 )
@@ -718,39 +728,15 @@ class SchedulerPPMixin:
                 latencies.append(latency_ms)
 
                 # Release KV and Mamba cache
-                if req.req_pool_idx is not None:
-                    kv_indices = self.req_to_token_pool.req_to_token[
-                        req.req_pool_idx, : req.extend_range.end
-                    ]
-                    self.token_to_kv_pool_allocator.free(kv_indices)
-                    if req.mamba_pool_idx is not None:
-                        self.req_to_token_pool.free_mamba_cache(req)
-                    self.req_to_token_pool.free(req)
-                    req.kv = None
+                if req.kv.holds_kv:
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
 
             logger.info(
                 f"[PP Dynamic Chunk] [PP0] Profiled {len(seq_lens)} samples: "
                 f"seq_lens={seq_lens}, latencies_ms={latencies}"
             )
 
-            if self.ps.attn_tp_size > 1:
-                data_to_sync_tp = [seq_lens, latencies]
-                data_to_sync_tp = broadcast_pyobj(
-                    data_to_sync_tp,
-                    self.attn_tp_group.rank,
-                    self.attn_tp_cpu_group,
-                    src=self.attn_tp_group.ranks[0],
-                )
-                seq_lens, latencies = data_to_sync_tp
-
-            if self.ps.attn_cp_size > 1:
-                data_to_sync_tp = [seq_lens, latencies]
-                data_to_sync_tp = broadcast_pyobj(
-                    data_to_sync_tp,
-                    self.attn_cp_group.rank,
-                    self.attn_cp_cpu_group,
-                    src=self.attn_cp_group.ranks[0],
-                )
+            seq_lens, latencies = attn_cp_tp_broadcast_pyobj([seq_lens, latencies])
 
         # Broadcast data to all ranks
         if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -995,22 +981,7 @@ class SchedulerPPMixin:
         else:
             data = None
 
-        if self.ps.attn_tp_size > 1:
-            data = broadcast_pyobj(
-                data,
-                self.attn_tp_group.rank,
-                self.attn_tp_cpu_group,
-                src=self.attn_tp_group.ranks[0],
-            )
-
-        if self.ps.attn_cp_size > 1:
-            data = broadcast_pyobj(
-                data,
-                self.attn_cp_group.rank,
-                self.attn_cp_cpu_group,
-                src=self.attn_cp_group.ranks[0],
-            )
-
+        data = attn_cp_tp_broadcast_pyobj(data)
         return data
 
     def _pp_prepare_tensor_dict(
@@ -1020,12 +991,26 @@ class SchedulerPPMixin:
             "next_token_ids": result.next_token_ids,
         }
 
+        # Draft extend runs only on the last stage, but every rank needs its relayed
+        # output to fill PD auxiliary buffers.
+        draft_input = result.next_draft_input
+        if draft_input is not None and draft_input.topk_p is not None:
+            tensor_dict["draft_topk_p"] = draft_input.topk_p.contiguous()
+            tensor_dict["draft_topk_index"] = draft_input.topk_index.contiguous()
+            tensor_dict["draft_hidden_states"] = draft_input.hidden_states.contiguous()
+
         if batch.return_logprob:
             logprob_dict = get_logprob_dict_from_result(result)
             tensor_dict = {
                 **tensor_dict,
                 **logprob_dict,
             }
+        auxiliary_output = (
+            result.logits_output.auxiliary_device_output
+            if result.logits_output is not None
+            else None
+        )
+        add_auxiliary_output_to_pp_tensors(tensor_dict, auxiliary_output)
         return tensor_dict
 
     def _pp_send_dict_to_next_stage(
@@ -1150,22 +1135,61 @@ class SchedulerPPMixin:
                 extend_input_len_per_req,
                 extend_logprob_start_len_per_req,
             ) = get_logprob_from_pp_outputs(pp_outputs)
+        if self.pp_group.is_first_rank:
+            observer = self.tp_worker.model_runner.sampling_observer
+            auxiliary_output = pop_auxiliary_output_from_pp_tensors(
+                pp_outputs.tensors,
+                observer,
+            )
+            if auxiliary_output is not None:
+                if logits_output is None:
+                    logits_output = LogitsProcessorOutput(next_token_logits=None)
+                logits_output.auxiliary_device_output = auxiliary_output
         next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
+
+        # Rebind the last stage's ring proposal as batch.spec_info so the PD result
+        # processor sees the same object on every rank.
+        next_draft_input = None
+        if "draft_topk_p" in pp_outputs.tensors:
+            from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+            next_draft_input = EagleDraftInput(
+                topk_p=pp_outputs["draft_topk_p"],
+                topk_index=pp_outputs["draft_topk_index"],
+                hidden_states=pp_outputs["draft_hidden_states"],
+                bonus_tokens=next_token_ids,
+                num_tokens_per_req=1,
+                num_tokens_for_logprob_per_req=1,
+            )
+            batch.spec_info = next_draft_input
+
         # PP rank 0 also relays into output_tokens_buf so the next iter's
         # resolve_forward_inputs finds these tokens for the decode portion
         # of mixed-chunk batches (which gather via mix_running_indices).
         self.future_map.stash(
-            batch.req_pool_indices, RelayPayload(bonus_tokens=next_token_ids)
+            batch.req_pool_indices,
+            RelayPayload(
+                bonus_tokens=next_token_ids,
+                topk_p=None if next_draft_input is None else next_draft_input.topk_p,
+                topk_index=(
+                    None if next_draft_input is None else next_draft_input.topk_index
+                ),
+                hidden_states=(
+                    None if next_draft_input is None else next_draft_input.hidden_states
+                ),
+            ),
         )
         batch.input_ids = None
         output_result = GenerationBatchResult(
             logits_output=logits_output,
             pp_hidden_states_proxy_tensors=None,
             next_token_ids=pp_outputs["next_token_ids"],
+            next_draft_input=next_draft_input,
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
         )
+        output_result.copy_auxiliary_output_to_cpu()
         return output_result
 
     def _pp_process_batch_result(
