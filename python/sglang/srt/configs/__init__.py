@@ -17,6 +17,7 @@ from sglang.srt.configs.dots_vlm import DotsVLMConfig
 from sglang.srt.configs.exaone import ExaoneConfig
 from sglang.srt.configs.falcon_h1 import FalconH1Config
 from sglang.srt.configs.granitemoehybrid import GraniteMoeHybridConfig
+from sglang.srt.configs.hy_v4 import HYV4Config
 from sglang.srt.configs.inkling import (
     InklingAudioConfig,
     InklingMMConfig,
@@ -51,6 +52,7 @@ from sglang.srt.configs.muse_glimmer import (
     MuseGlimmerAssistantConfig,
     MuseGlimmerConfig,
 )
+from sglang.srt.configs.nanbeige import NanbeigeConfig
 from sglang.srt.configs.nano_nemotron_vl import (
     NemotronH_Nano_Omni_Reasoning_V3_Config,
     NemotronH_Nano_VL_V2_Config,
@@ -118,6 +120,7 @@ __all__ = [
     "Dots3Config",
     "FalconH1Config",
     "GraniteMoeHybridConfig",
+    "HYV4Config",
     "Lfm2Config",
     "Lfm2MoeConfig",
     "Lfm2VlConfig",
@@ -128,6 +131,7 @@ __all__ = [
     "NemotronHPuzzleConfig",
     "NemotronH_Nano_VL_V2_Config",
     "NemotronH_Nano_Omni_Reasoning_V3_Config",
+    "NanbeigeConfig",
     "JetNemotronConfig",
     "JetVLMConfig",
     "MiniCPMHybridConfig",
